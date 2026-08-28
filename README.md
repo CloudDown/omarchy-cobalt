@@ -1,58 +1,38 @@
+<p align="center">
+  <img src="assets/ui-main.png" width="540" alt="Cobalt Download — main panel" />
+</p>
+
 # Cobalt Download
 
-Unofficial Omarchy bar widget. Paste a public media link, save the file. The panel drops under the bar icon like Wi-Fi or audio.
+Paste a link, save the file. An unofficial [Omarchy](https://omarchy.org) bar panel.
 
-This is **not** [cobalt.tools](https://cobalt.tools) and is **not** made by [imput](https://github.com/imputnet/cobalt). It talks to a community [cobalt](https://github.com/imputnet/cobalt) API when that works, and falls back to [yt-dlp](https://github.com/yt-dlp/yt-dlp) when the instance cannot fetch the link (YouTube, flaky TikTok, etc.).
+Not [cobalt.tools](https://cobalt.tools). Not affiliated with [imput](https://github.com/imputnet/cobalt).
+
+<p align="center">
+  <img src="assets/ui-settings.png" width="540" alt="Cobalt Download — settings" />
+</p>
 
 ## Install
 
 ```sh
+omarchy pkg add yt-dlp ffmpeg
 omarchy plugin add https://github.com/CloudDown/omarchy-cobalt.git --enable
 ```
 
-Optional: move the icon.
+**Install `yt-dlp` and `ffmpeg` yourself.** The plugin does not do it. A full Omarchy install often already has them; if YouTube (or the fallback) fails, run the first line.
+
+Also needed: `python3`, `wl-paste`, `xdg-open` (stock Omarchy).
+
+## Use
+
+Click the bar icon → **paste** a URL → **auto** / **audio** / **mute** → **download**.
+
+Cobalt API first, then **yt-dlp** if the instance cannot fetch the link. Gear = quality, audio format, folder.
 
 ```sh
 omarchy bar move clouddown.cobalt --section right
+omarchy-shell shell toggle clouddown.cobalt
 ```
-
-## Usage
-
-- Click the bar icon to open or close the panel
-- Paste a URL (or use **paste**), pick **auto** / **audio** / **mute**, then **download**
-- **cancel** stops the current job; **open** opens the last saved file
-- Escape closes; Tab switches to the neighbouring bar panel
-- Settings (gear): max quality, audio format, download folder — saved as you change them
-
-Command: `omarchy-shell shell toggle clouddown.cobalt`
-
-## How a download works
-
-1. The plugin POSTs the URL to a cobalt API instance (`https://cobaltapi.cjs.nz` by default).
-2. If the instance returns a tunnel, redirect, or picker, the file is saved from there.
-3. If the instance errors (YouTube login, `fetch.fail`, timeout, unreachable), **yt-dlp** downloads the original URL instead. The panel shows `Trying yt-dlp…` and a progress bar.
-
-Official `api.cobalt.tools` uses bot protection (Turnstile) and is not used. Community instances can block YouTube/TikTok at any time; that is why yt-dlp is there.
-
-Settings live in `~/.config/omarchy/cobalt.json` (created on first save). Empty `downloadDir` means `~/Downloads`.
-
-## Dependencies
-
-Must already be on the machine (the plugin does not install packages or use sudo):
-
-- `python3` (stdlib only for the helper)
-- `yt-dlp`
-- `ffmpeg` (yt-dlp merge / audio extract)
-- `wl-paste`
-- `xdg-open`
-- network access to the cobalt instance and to the media site
-
-## What it does not do
-
-- No sudo, no extra Quickshell process, no notifications after save
-- Does not log into YouTube / Reddit / Vimeo; those sites may still fail even with yt-dlp if they want cookies
-- Does not ship your Hyprland keybinding or Omarchy menu row — add those yourself if you want them
-- Not affiliated with imput / cobalt.tools. Mascot and chevron mark in the UI are used as a tribute to cobalt; they are **not** licensed for reuse. See [cobalt credits](https://cobalt.tools/about/credits). Do not treat this plugin as official cobalt branding.
 
 ## Remove
 
@@ -60,10 +40,8 @@ Must already be on the machine (the plugin does not install packages or use sudo
 omarchy plugin remove clouddown.cobalt
 ```
 
-This does not delete `~/.config/omarchy/cobalt.json`.
+Keeps `~/.config/omarchy/cobalt.json`.
 
 ## License
 
-MIT. See `LICENSE`.
-
-Cobalt API: [AGPL-3.0](https://github.com/imputnet/cobalt). yt-dlp: [Unlicense](https://github.com/yt-dlp/yt-dlp). You are responsible for what you download.
+MIT. You are responsible for what you download.
