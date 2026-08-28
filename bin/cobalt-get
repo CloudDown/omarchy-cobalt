@@ -1,0 +1,416 @@
+#!/usr/bin/python3
+"""Talk to a cobalt API instance and save the resulting file.
+
+stdout is JSON only — one object for `resolve`, newline-delimited events for `save`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from typing import Any
+
+UA = "clouddown.cobalt/1.0 (+https://github.com/imputnet/cobalt)"
+TIMEOUT = 60
+CHUNK = 256 * 1024
+SSL_CTX = ssl.create_default_context()
+DEFAULT_CONFIG = os.path.expanduser("~/.config/omarchy/cobalt.json")
+JSON_HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "User-Agent": UA,
+}
+
+
+def emit(obj: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def error_payload(code: str, message: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
+    err: dict[str, Any] = {"code": code, "message": message}
+    if context:
+        err["context"] = context
+    return {"status": "error", "error": err}
+
+
+def fail(message: str, code: str = "error.plugin") -> int:
+    emit(error_payload(code, message))
+    return 1
+
+
+def load_config(path: str | None) -> dict[str, Any]:
+    try:
+        with open(path or DEFAULT_CONFIG, encoding="utf-8") as fh:
+            parsed = json.load(fh)
+            return parsed if isinstance(parsed, dict) else {}
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+
+
+def instance_url(raw: str) -> str:
+    value = (raw or "").strip() or "https://cobaltapi.cjs.nz"
+    if "://" not in value:
+        value = "https://" + value
+    return value.rstrip("/") + "/"
+
+
+def open_url(req: urllib.request.Request, timeout: int = TIMEOUT):
+    return urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX)
+
+
+def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), method="POST", headers=JSON_HEADERS
+    )
+    try:
+        with open_url(req) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        return error_payload("error.http", f"HTTP {exc.code}", {"status": exc.code})
+    except urllib.error.URLError as exc:
+        return error_payload("error.api.fetch.fail", str(exc.reason or exc))
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return error_payload("error.http", "Instance returned non-JSON")
+    if isinstance(parsed, dict):
+        return parsed
+    return error_payload("error.http", "Instance returned non-object JSON")
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    result = post_json(
+        instance_url(args.instance or cfg.get("instance") or ""),
+        {
+            "url": args.url,
+            "downloadMode": args.mode,
+            "videoQuality": args.quality,
+            "audioFormat": args.audio_format,
+            "filenameStyle": args.filename_style,
+            "alwaysProxy": True,
+            "localProcessing": "disabled",
+            "disableMetadata": False,
+        },
+    )
+    emit(result)
+    return 0 if result.get("status") != "error" else 1
+
+
+def safe_filename(name: str) -> str:
+    base = os.path.basename(name or "").strip() or "cobalt-download"
+    base = re.sub(r"[\x00-\x1f]", "", base)
+    base = base.replace("/", "_").replace("\\", "_")
+    if base in {".", ".."}:
+        base = "cobalt-download"
+    return base[:180]
+
+
+def unique_path(directory: str, filename: str) -> str:
+    path = os.path.join(directory, filename)
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(filename)
+    n = 1
+    while True:
+        candidate = os.path.join(directory, f"{stem}-{n}{ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
+
+
+def filename_from_headers(headers: Any, fallback: str) -> str:
+    disposition = headers.get("Content-Disposition") if headers else None
+    if disposition:
+        match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', disposition, re.I)
+        if match:
+            return safe_filename(urllib.request.unquote(match.group(1)))
+    return safe_filename(fallback)
+
+
+def cmd_save(args: argparse.Namespace) -> int:
+    directory = os.path.expanduser(args.dir or "") or os.path.expanduser("~/Downloads")
+    os.makedirs(directory, exist_ok=True)
+
+    req = urllib.request.Request(args.url, headers={"User-Agent": UA}, method="GET")
+    try:
+        resp = open_url(req)
+    except urllib.error.HTTPError as exc:
+        return fail(f"Download failed (HTTP {exc.code})", "error.http")
+    except urllib.error.URLError as exc:
+        return fail(str(exc.reason or exc), "error.api.fetch.fail")
+
+    filename = filename_from_headers(resp.headers, args.filename or "cobalt-download")
+    path = unique_path(directory, filename)
+    total = 0
+    try:
+        length = resp.headers.get("Content-Length") or resp.headers.get("Estimated-Content-Length")
+        total = int(length) if length else 0
+    except (TypeError, ValueError):
+        total = 0
+
+    emit({"event": "start", "filename": os.path.basename(path), "path": path, "bytes": total})
+    written = 0
+    last_percent = -1
+    tmp_path = path + ".part"
+    try:
+        with open(tmp_path, "wb") as fh:
+            while True:
+                chunk = resp.read(CHUNK)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                written += len(chunk)
+                if total > 0:
+                    percent = min(100, int(written * 100 / total))
+                    if percent != last_percent:
+                        last_percent = percent
+                        emit({"event": "progress", "percent": percent, "bytes": written, "total": total})
+                elif written == chunk:
+                    emit({"event": "progress", "percent": -1, "bytes": written, "total": 0})
+        os.replace(tmp_path, path)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return fail(str(exc), "error.plugin")
+    finally:
+        try:
+            resp.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    emit({"event": "done", "path": path, "filename": os.path.basename(path), "bytes": written})
+    return 0
+
+
+def ytdlp_bin() -> str | None:
+    return shutil.which("yt-dlp") or ("/usr/bin/yt-dlp" if os.path.isfile("/usr/bin/yt-dlp") else None)
+
+
+def ytdlp_argv(binary: str) -> list[str]:
+    py = ""
+    try:
+        with open(binary, encoding="utf-8") as fh:
+            first = fh.readline()
+        if first.startswith("#!"):
+            py = first[2:].strip().split()[0]
+    except OSError:
+        py = ""
+    if py and os.path.isfile(py):
+        return [py, "-u", binary]
+    return [binary]
+
+
+def ytdlp_format(mode: str, quality: str) -> str:
+    height = None
+    if quality and quality not in {"max", "best"}:
+        try:
+            height = int(quality)
+        except ValueError:
+            height = None
+    if mode == "mute":
+        return f"bestvideo[height<={height}]/bestvideo" if height else "bestvideo/best"
+    if height:
+        return f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
+    return "bv*+ba/b"
+
+
+def cmd_ytdlp(args: argparse.Namespace) -> int:
+    binary = ytdlp_bin()
+    if not binary:
+        return fail("yt-dlp is not installed", "error.plugin")
+
+    directory = os.path.expanduser(args.dir or "") or os.path.expanduser("~/Downloads")
+    os.makedirs(directory, exist_ok=True)
+    marker = os.path.join(directory, f".cobalt-ytdlp-{os.getpid()}")
+    template = os.path.join(directory, "%(title).120B [%(id)s].%(ext)s")
+    flags = [
+        "--ignore-config",
+        "--no-playlist",
+        "--no-warnings",
+        "--no-color",
+        "--newline",
+        "--progress",
+        "--progress-template", "download:COBALT %(progress._percent_str)s",
+        "--restrict-filenames",
+        "-o", template,
+        "--print-to-file", "after_move:filepath", marker,
+    ]
+    if args.mode == "audio":
+        flags = ["-x"] + flags
+        fmt = str(args.audio_format or "mp3")
+        if fmt and fmt != "best":
+            flags = ["--audio-format", fmt] + flags
+    else:
+        flags += ["-f", ytdlp_format(args.mode, args.quality)]
+        if args.mode == "auto":
+            flags += ["--merge-output-format", "mp4"]
+    cmd = ytdlp_argv(binary) + flags + [args.url]
+
+    emit({"event": "start", "filename": "yt-dlp", "path": "", "bytes": 0})
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        start_new_session=True,
+        env=env,
+    )
+
+    def stop(_signum=None, _frame=None) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            proc.terminate()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    last_percent = -1
+    last_path = ""
+    filename = "yt-dlp"
+    percent_re = re.compile(r"(?:COBALT|\[download\])\s+(\d+(?:\.\d+)?)%")
+    dest_re = re.compile(r"Destination:\s+(.+)$")
+    merge_re = re.compile(r'Merging formats into "(.+)"')
+    try:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.strip()
+            if not line:
+                continue
+            dest = dest_re.search(line) or merge_re.search(line)
+            if dest:
+                last_path = dest.group(1).strip().strip('"')
+                filename = os.path.basename(last_path)
+                emit({"event": "start", "filename": filename, "path": last_path, "bytes": 0})
+                continue
+            match = percent_re.search(line)
+            if not match:
+                continue
+            percent = min(100, int(float(match.group(1))))
+            if percent == last_percent:
+                continue
+            last_percent = percent
+            emit({"event": "progress", "percent": percent, "filename": filename})
+        code = proc.wait()
+    except Exception as exc:  # noqa: BLE001
+        stop()
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+        return fail(str(exc), "error.plugin")
+
+    path = ""
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            path = fh.read().strip().splitlines()[-1].strip()
+    except (OSError, IndexError):
+        path = ""
+    try:
+        os.unlink(marker)
+    except OSError:
+        pass
+    if not path:
+        path = last_path
+
+    if code != 0 or not path or not os.path.isfile(path):
+        return fail("yt-dlp could not download that link", "error.plugin")
+    emit({"event": "done", "path": path, "filename": os.path.basename(path), "bytes": os.path.getsize(path)})
+    return 0
+
+
+def cmd_probe(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    req = urllib.request.Request(
+        instance_url(args.instance or cfg.get("instance") or ""),
+        headers={"Accept": "application/json", "User-Agent": UA},
+        method="GET",
+    )
+    try:
+        with open_url(req, timeout=12) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            emit(json.loads(body) if body else {"ok": True})
+            return 0
+    except Exception as exc:  # noqa: BLE001
+        return fail(str(exc), "error.api.fetch.fail")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", default=DEFAULT_CONFIG)
+
+    parser = argparse.ArgumentParser(description="Cobalt API helper for the Omarchy plugin", parents=[common])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    resolve = sub.add_parser("resolve", help="Ask an instance for a download", parents=[common])
+    resolve.add_argument("--url", required=True)
+    resolve.add_argument("--mode", default="auto", choices=["auto", "audio", "mute"])
+    resolve.add_argument("--quality", default="1080")
+    resolve.add_argument("--audio-format", default="mp3")
+    resolve.add_argument("--filename-style", default="pretty")
+    resolve.add_argument("--instance")
+    resolve.set_defaults(func=cmd_resolve)
+
+    save = sub.add_parser("save", help="Download a cobalt tunnel or redirect URL", parents=[common])
+    save.add_argument("--url", required=True)
+    save.add_argument("--filename", default="")
+    save.add_argument("--dir", default="")
+    save.set_defaults(func=cmd_save)
+
+    probe = sub.add_parser("probe", help="GET / on an instance", parents=[common])
+    probe.add_argument("--instance")
+    probe.set_defaults(func=cmd_probe)
+
+    ytdlp = sub.add_parser("ytdlp", help="Download with yt-dlp when cobalt cannot", parents=[common])
+    ytdlp.add_argument("--url", required=True)
+    ytdlp.add_argument("--mode", default="auto", choices=["auto", "audio", "mute"])
+    ytdlp.add_argument("--quality", default="1080")
+    ytdlp.add_argument("--audio-format", default="mp3")
+    ytdlp.add_argument("--dir", default="")
+    ytdlp.set_defaults(func=cmd_ytdlp)
+
+    return parser
+
+
+def main() -> int:
+    try:
+        args = build_parser().parse_args()
+        return args.func(args)
+    except SystemExit as exc:
+        if exc.code in (0, None):
+            raise
+        return fail("Invalid helper arguments")
+    except Exception as exc:  # noqa: BLE001
+        return fail(str(exc) or "Downloader crashed")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

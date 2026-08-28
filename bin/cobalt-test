@@ -1,0 +1,249 @@
+#!/usr/bin/python3
+"""Probe every service this cobalt instance advertises.
+
+Uses cobalt-get resolve (and one save per successful tunnel). stdout is a table.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cobalt-get")
+INSTANCE = "https://cobaltapi.cjs.nz"
+PAUSE = 1.5
+
+# Public fixtures used by instance trackers. Dead links still count as a probe.
+CASES = [
+    {"name": "twitter", "url": "https://x.com/OnFeedr/status/2093217443820732492/video/1", "modes": ["auto", "audio", "mute"], "save": True},
+    {"name": "tiktok", "url": "https://www.tiktok.com/@chupichouchou/video/7672111038766091553", "modes": ["auto", "audio", "mute"], "save": True},
+    {"name": "youtube", "url": "https://www.youtube.com/watch?v=jNQXAC9IVRw", "modes": ["auto"], "save": True},
+    {"name": "youtube shorts", "url": "https://www.youtube.com/shorts/59bBxlmhefQ", "modes": ["auto"], "save": False},
+    {"name": "youtube music", "url": "https://music.youtube.com/watch?v=diKrIyir5WM", "modes": ["auto"], "save": False},
+    {"name": "instagram", "url": "https://www.instagram.com/reel/Cj5kgOPs0lf", "modes": ["auto", "audio", "mute"], "save": True},
+    {"name": "soundcloud", "url": "https://soundcloud.com/r3dz3r/nom", "modes": ["audio"], "save": True},
+    {"name": "reddit", "url": "https://www.reddit.com/r/softwaregore/comments/de7wso/seriously_guys/", "modes": ["auto"], "save": True},
+    {"name": "bluesky", "url": "https://bsky.app/profile/did:plc:vshnclkqqguyg6xcz6q7g65k/post/3l72nrxow7a2f", "modes": ["auto"], "save": True},
+    {"name": "vimeo", "url": "https://vimeo.com/941755175", "modes": ["auto"], "save": False},
+    {"name": "facebook", "url": "https://web.facebook.com/100048111287134/videos/1157798148685638", "modes": ["auto"], "save": False},
+    {"name": "snapchat", "url": "https://www.snapchat.com/spotlight/W7_EDlXWTBiXAEEniNoMPwAAYdWxucG9pZmNqAY46j0a5AY46j0YbAAAAAQ", "modes": ["auto"], "save": False},
+    {"name": "pinterest", "url": "https://www.pinterest.com/pin/10203536647121568", "modes": ["auto"], "save": False},
+    {"name": "tumblr", "url": "https://www.tumblr.com/artifyber/728754268418523136/261365-catnip", "modes": ["auto"], "save": False},
+    {"name": "twitch clips", "url": "https://twitch.tv/rtgame/clip/TubularInventiveSardineCorgiDerp-PM47mJQQ2vsL5B5G", "modes": ["auto"], "save": False},
+    {"name": "dailymotion", "url": "https://www.dailymotion.com/video/x96o9io", "modes": ["auto"], "save": False},
+    {"name": "streamable", "url": "https://streamable.com/3zjyo3", "modes": ["auto"], "save": True},
+    {"name": "vk", "url": "https://vk.com/video-59537484_456239268", "modes": ["auto"], "save": False},
+    {"name": "ok.ru", "url": "https://ok.ru/video/7475662490142", "modes": ["auto"], "save": False},
+    {"name": "bilibili", "url": "https://www.bilibili.com/video/BV1Rk4y1n71i", "modes": ["auto"], "save": False},
+    {"name": "rutube", "url": "https://rutube.ru/video/3c1386e4ae7bc4dae9f7506e5bf30556/", "modes": ["auto"], "save": False},
+    {"name": "loom", "url": "https://www.loom.com/share/aa3d8b08bee74d05af5b42989e9f33e9", "modes": ["auto"], "save": False},
+    {"name": "newgrounds", "url": "https://www.newgrounds.com/audio/listen/1", "modes": ["audio"], "save": False},
+    {"name": "xiaohongshu", "url": "https://xhslink.com/m/4aOFYMI2W7I", "modes": ["auto"], "save": False},
+]
+
+INSTANCE_CODES = {
+    "error.api.youtube.login",
+    "error.api.youtube.token.invalid",
+    "error.api.youtube.cipher",
+    "error.api.fetch.fail",
+    "error.api.fetch.critical",
+    "error.api.fetch.empty",
+    "error.api.rate_exceeded",
+    "error.api.auth.jwt.missing",
+    "error.api.auth.api-key.missing",
+    "error.api.auth.api-key.invalid",
+    "error.api.service.unsupported",
+    "error.api.link.invalid",
+    "error.api.link.unsupported",
+    "error.api.content.video.unavailable",
+    "error.api.content.video.live",
+    "error.api.content.post.unavailable",
+    "error.http",
+}
+
+
+def run_helper(args: list[str], timeout: int = 70) -> dict:
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/python3", "-u", HELPER, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "error": {"code": "error.plugin", "message": "helper timed out"}}
+    text = (proc.stdout or "").strip()
+    if not text:
+        err = (proc.stderr or "").strip()
+        return {"status": "error", "error": {"code": "error.plugin", "message": err or "empty helper output"}}
+    last = ""
+    parsed = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        last = line
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        parsed = obj
+        if isinstance(obj, dict) and obj.get("event") == "done":
+            return obj
+        if isinstance(obj, dict) and obj.get("event") == "error":
+            return obj
+    if isinstance(parsed, dict):
+        return parsed
+    return {"status": "error", "error": {"code": "error.plugin", "message": last or "invalid JSON"}}
+
+
+def error_code(payload: dict) -> str:
+    err = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    return str(err.get("code") or payload.get("code") or "")
+
+
+def classify(payload: dict) -> str:
+    status = str(payload.get("status") or payload.get("event") or "")
+    if status in {"tunnel", "redirect", "picker", "done"}:
+        return "ok"
+    code = error_code(payload)
+    if code in INSTANCE_CODES or code.startswith("error.api."):
+        return "instance"
+    return "plugin"
+
+
+def resolve(url: str, mode: str) -> dict:
+    return run_helper([
+        "--config", os.path.expanduser("~/.config/omarchy/cobalt.json"),
+        "resolve",
+        "--instance", INSTANCE,
+        "--url", url,
+        "--mode", mode,
+        "--quality", "1080",
+        "--audio-format", "mp3",
+    ])
+
+
+def save(url: str, filename: str, directory: str) -> dict:
+    return run_helper([
+        "save",
+        "--url", url,
+        "--filename", filename,
+        "--dir", directory,
+    ], timeout=90)
+
+
+def ytdlp_probe(url: str, mode: str) -> dict:
+    binary = shutil.which("yt-dlp") or "/usr/bin/yt-dlp"
+    cmd = [
+        binary,
+        "--ignore-config",
+        "--no-playlist",
+        "--no-warnings",
+        "--no-color",
+        "--skip-download",
+        "--print", "%(title)s",
+        url,
+    ]
+    if mode == "audio":
+        cmd[1:1] = ["-x"]
+    elif mode == "mute":
+        cmd.extend(["-f", "bestvideo/best"])
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "error": {"code": "error.plugin", "message": "yt-dlp timed out"}}
+    title = (proc.stdout or "").strip().splitlines()
+    title = title[-1].strip() if title else ""
+    if proc.returncode == 0 and title:
+        return {"status": "ytdlp", "filename": title}
+    err = (proc.stderr or proc.stdout or "yt-dlp failed").strip().splitlines()
+    return {"status": "error", "error": {"code": "error.plugin", "message": err[-1] if err else "yt-dlp failed"}}
+
+
+def main() -> int:
+    out_dir = tempfile.mkdtemp(prefix="cobalt-test-")
+    rows: list[dict] = []
+    first = True
+    for case in CASES:
+        saved = False
+        for mode in case["modes"]:
+            if not first:
+                time.sleep(PAUSE)
+            first = False
+            payload = resolve(case["url"], mode)
+            status = str(payload.get("status") or "")
+            kind = classify(payload)
+            note = payload.get("filename") or ""
+            if status == "error":
+                note = error_code(payload) or str((payload.get("error") or {}).get("message") or "error")
+            elif status == "picker":
+                note = f"{len(payload.get('picker') or [])} items"
+            row = {
+                "site": case["name"],
+                "mode": mode,
+                "status": status or str(payload.get("event") or "?"),
+                "class": kind,
+                "detail": note,
+            }
+            if kind != "ok":
+                time.sleep(PAUSE)
+                fallback = ytdlp_probe(case["url"], mode)
+                if fallback.get("status") == "ytdlp":
+                    row["class"] = "ytdlp"
+                    row["status"] = "ytdlp"
+                    row["detail"] = "yt-dlp: " + str(fallback.get("filename") or "ok")
+                else:
+                    row["detail"] = note + " | yt-dlp: " + str((fallback.get("error") or {}).get("message") or "fail")
+            elif (
+                case.get("save")
+                and not saved
+                and status in {"tunnel", "redirect"}
+                and payload.get("url")
+                and case["name"] in {"twitter", "youtube"}
+            ):
+                time.sleep(PAUSE)
+                saved_payload = save(str(payload["url"]), str(payload.get("filename") or ""), out_dir)
+                saved = True
+                if saved_payload.get("event") == "done" or saved_payload.get("status") == "done":
+                    row["class"] = "ok"
+                    row["detail"] = os.path.basename(str(saved_payload.get("path") or note))
+                else:
+                    time.sleep(PAUSE)
+                    fallback = ytdlp_probe(case["url"], mode)
+                    if fallback.get("status") == "ytdlp":
+                        row["class"] = "ytdlp"
+                        row["status"] = "ytdlp"
+                        row["detail"] = "save fail, yt-dlp: " + str(fallback.get("filename") or "ok")
+                    else:
+                        row["class"] = classify(saved_payload)
+                        row["detail"] = "save: " + (error_code(saved_payload) or "fail")
+            rows.append(row)
+            print(f"{row['site']:<16} {row['mode']:<6} {row['class']:<9} {row['status']:<12} {row['detail']}", flush=True)
+            if mode == "auto" and row["class"] not in {"ok", "ytdlp"}:
+                break
+
+    print()
+    print(f"files: {out_dir}")
+    counts: dict[str, int] = {}
+    sites = {}
+    for row in rows:
+        counts[row["class"]] = counts.get(row["class"], 0) + 1
+        prev = sites.get(row["site"])
+        if prev in (None, "instance", "plugin") or row["class"] in {"ok", "ytdlp"}:
+            if prev in {"ok", "ytdlp"} and row["class"] not in {"ok", "ytdlp"}:
+                pass
+            else:
+                sites[row["site"]] = row["class"]
+    print("rows", " ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    print("sites", " ".join(f"{name}={kind}" for name, kind in sites.items()))
+    return 0 if all(kind in {"ok", "ytdlp"} for kind in sites.values()) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

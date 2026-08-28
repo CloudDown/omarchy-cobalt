@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "clouddown.cobalt",
+  "name": "Cobalt Download",
+  "version": "1.3.0",
+  "author": "CloudDown",
+  "license": "MIT",
+  "description": "Paste a link and save the video or audio with cobalt.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Cobalt.qml"
+  },
+  "barWidget": {
+    "displayName": "Cobalt Download",
+    "description": "Download media from a link, from the bar",
+    "category": "Tools",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
