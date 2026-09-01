@@ -115,8 +115,12 @@ function normalizeInstance(value) {
   return s.replace(/\/+$/, "")
 }
 
+function isHttpUrl(value) {
+  return /^https?:\/\//i.test(String(value || "").trim())
+}
+
 function looksLikeUrl(value) {
-  return !!extractUrl(value)
+  return isHttpUrl(extractUrl(value))
 }
 
 function extractUrl(value) {
@@ -137,11 +141,8 @@ function trimUrlJunk(value) {
 
 function normalizeUrl(value) {
   var extracted = extractUrl(value)
-  if (extracted) return extracted
-  var text = String(value || "").trim()
-  if (!text) return ""
-  if (text.indexOf("://") === -1) text = "https://" + text
-  return trimUrlJunk(text)
+  if (isHttpUrl(extracted)) return extracted
+  return ""
 }
 
 function errorCode(payload) {

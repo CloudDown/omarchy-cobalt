@@ -16,6 +16,7 @@ import ssl
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -61,7 +62,17 @@ def instance_url(raw: str) -> str:
     value = (raw or "").strip() or "https://cobaltapi.cjs.nz"
     if "://" not in value:
         value = "https://" + value
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        value = "https://cobaltapi.cjs.nz"
     return value.rstrip("/") + "/"
+
+
+def http_url(value: str) -> str | None:
+    parsed = urllib.parse.urlparse((value or "").strip())
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return None
+    return parsed.geturl()
 
 
 def open_url(req: urllib.request.Request, timeout: int = TIMEOUT):
@@ -96,11 +107,14 @@ def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def cmd_resolve(args: argparse.Namespace) -> int:
+    url = http_url(args.url)
+    if not url:
+        return fail("That does not look like a supported link", "error.api.link.invalid")
     cfg = load_config(args.config)
     result = post_json(
         instance_url(args.instance or cfg.get("instance") or ""),
         {
-            "url": args.url,
+            "url": url,
             "downloadMode": args.mode,
             "videoQuality": args.quality,
             "audioFormat": args.audio_format,
@@ -146,10 +160,13 @@ def filename_from_headers(headers: Any, fallback: str) -> str:
 
 
 def cmd_save(args: argparse.Namespace) -> int:
+    url = http_url(args.url)
+    if not url:
+        return fail("Refusing to fetch a non-HTTP URL", "error.plugin")
     directory = os.path.expanduser(args.dir or "") or os.path.expanduser("~/Downloads")
     os.makedirs(directory, exist_ok=True)
 
-    req = urllib.request.Request(args.url, headers={"User-Agent": UA}, method="GET")
+    req = urllib.request.Request(url, headers={"User-Agent": UA}, method="GET")
     try:
         resp = open_url(req)
     except urllib.error.HTTPError as exc:
@@ -235,6 +252,9 @@ def ytdlp_format(mode: str, quality: str) -> str:
 
 
 def cmd_ytdlp(args: argparse.Namespace) -> int:
+    url = http_url(args.url)
+    if not url:
+        return fail("That does not look like a supported link", "error.api.link.invalid")
     binary = ytdlp_bin()
     if not binary:
         return fail("yt-dlp is not installed", "error.plugin")
@@ -264,7 +284,7 @@ def cmd_ytdlp(args: argparse.Namespace) -> int:
         flags += ["-f", ytdlp_format(args.mode, args.quality)]
         if args.mode == "auto":
             flags += ["--merge-output-format", "mp4"]
-    cmd = ytdlp_argv(binary) + flags + [args.url]
+    cmd = ytdlp_argv(binary) + flags + ["--", url]
 
     emit({"event": "start", "filename": "yt-dlp", "path": "", "bytes": 0})
     env = os.environ.copy()

@@ -129,6 +129,7 @@ Panel {
       root.openLastFile()
       return
     }
+    if (!root.canSubmit) return
     root.startDownload()
   }
 
@@ -241,9 +242,10 @@ Panel {
   }
 
   function enqueueSave(url, filename) {
-    if (!url) return
+    var href = String(url || "").trim()
+    if (!Model.isHttpUrl(href)) return
     var next = root.saveQueue.slice()
-    next.push({ url: url, filename: filename || "" })
+    next.push({ url: href, filename: filename || "" })
     root.saveQueue = next
   }
 
@@ -734,6 +736,7 @@ Panel {
                   text: root.busy ? "cancel" : (root.statusKind === "done" ? "open" : "download")
                   iconText: root.busy ? "󰜺" : (root.statusKind === "done" ? "󰏌" : "󰇚")
                   selected: !root.busy
+                  enabled: root.busy || root.statusKind === "done" || root.canSubmit
                   onClicked: root.downloadClicked()
                 }
               }
@@ -763,6 +766,7 @@ Panel {
                 width: parent.width
                 horizontalAlignment: Text.AlignHCenter
                 text: root.statusText
+                textFormat: Text.PlainText
                 color: root.statusKind === "error" ? Color.urgent : Qt.darker(root.foreground, 1.25)
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -784,6 +788,7 @@ Panel {
                 required property int index
                 width: body.width
                 text: modelData.label
+                textFormat: Text.PlainText
                 leftAlign: true
                 selected: index === root.pickerIndex
                 onClicked: {
