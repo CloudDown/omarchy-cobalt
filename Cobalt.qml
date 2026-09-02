@@ -788,7 +788,6 @@ Panel {
                 required property int index
                 width: body.width
                 text: modelData.label
-                textFormat: Text.PlainText
                 leftAlign: true
                 selected: index === root.pickerIndex
                 onClicked: {
