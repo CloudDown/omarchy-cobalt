@@ -23,6 +23,9 @@ from typing import Any
 UA = "clouddown.cobalt/1.0 (+https://github.com/imputnet/cobalt)"
 TIMEOUT = 60
 CHUNK = 256 * 1024
+MAX_JSON = 256 * 1024
+MAX_FILE = 512 * 1024 * 1024
+MAX_YTDLP_OUT = 256 * 1024
 SSL_CTX = ssl.create_default_context()
 DEFAULT_CONFIG = os.path.expanduser("~/.config/omarchy/cobalt.json")
 JSON_HEADERS = {
@@ -63,7 +66,7 @@ def instance_url(raw: str) -> str:
     if "://" not in value:
         value = "https://" + value
     parsed = urllib.parse.urlparse(value)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+    if parsed.scheme.lower() != "https" or not parsed.netloc or parsed.username or parsed.password:
         value = "https://cobaltapi.cjs.nz"
     return value.rstrip("/") + "/"
 
@@ -72,11 +75,33 @@ def http_url(value: str) -> str | None:
     parsed = urllib.parse.urlparse((value or "").strip())
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return None
+    if parsed.username or parsed.password:
+        return None
+    if parsed.scheme.lower() == "http" and parsed.hostname not in {"127.0.0.1", "localhost"}:
+        return None
     return parsed.geturl()
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        return None
+
+
 def open_url(req: urllib.request.Request, timeout: int = TIMEOUT):
-    return urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX)
+    opener = urllib.request.build_opener(
+        _NoRedirect(),
+        urllib.request.HTTPSHandler(context=SSL_CTX),
+    )
+    return opener.open(req, timeout=timeout)
+
+
+def read_capped(resp, limit: int) -> bytes:
+    buf = resp.read(limit + 1)
+    if buf is None:
+        return b""
+    if len(buf) > limit:
+        raise ValueError("response exceeded size limit")
+    return buf
 
 
 def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -85,9 +110,12 @@ def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     )
     try:
         with open_url(req) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
+            body = read_capped(resp, MAX_JSON).decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            body = read_capped(exc, MAX_JSON).decode("utf-8", errors="replace")
+        except ValueError:
+            return error_payload("error.http", "Instance returned too much data")
         try:
             parsed = json.loads(body)
             if isinstance(parsed, dict):
@@ -195,6 +223,8 @@ def cmd_save(args: argparse.Namespace) -> int:
                     break
                 fh.write(chunk)
                 written += len(chunk)
+                if written > MAX_FILE:
+                    raise ValueError("file exceeded size limit")
                 if total > 0:
                     percent = min(100, int(written * 100 / total))
                     if percent != last_percent:
@@ -313,12 +343,17 @@ def cmd_ytdlp(args: argparse.Namespace) -> int:
     last_percent = -1
     last_path = ""
     filename = "yt-dlp"
+    out_bytes = 0
     percent_re = re.compile(r"(?:COBALT|\[download\])\s+(\d+(?:\.\d+)?)%")
     dest_re = re.compile(r"Destination:\s+(.+)$")
     merge_re = re.compile(r'Merging formats into "(.+)"')
     try:
         assert proc.stdout is not None
         for raw in proc.stdout:
+            out_bytes += len(raw.encode("utf-8", "replace"))
+            if out_bytes > MAX_YTDLP_OUT:
+                stop()
+                return fail("yt-dlp output exceeded size limit", "error.plugin")
             line = raw.strip()
             if not line:
                 continue

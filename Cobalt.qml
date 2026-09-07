@@ -41,14 +41,19 @@ Panel {
   readonly property color background: Color.popups.background
   readonly property color mutedForeground: Qt.darker(root.foreground, 1.4)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
-  readonly property string getScript: Quickshell.env("HOME") + "/.config/omarchy/plugins/clouddown.cobalt/bin/cobalt-get"
+  readonly property string getScript: {
+    var u = Qt.resolvedUrl("bin/cobalt-get").toString()
+    if (u.indexOf("file://") === 0)
+      return decodeURIComponent(u.slice(7))
+    return u
+  }
   readonly property string configPath: Quickshell.env("HOME") + "/.config/omarchy/cobalt.json"
   readonly property bool canSubmit: Model.looksLikeUrl(root.urlText) && !root.busy
   readonly property bool editing: (urlField && urlField.activeFocus)
     || (dirField && dirField.activeFocus)
 
   function python(args) {
-    return ["/usr/bin/python3", "-u", root.getScript].concat(args)
+    return ["/usr/bin/python3", "-I", "-S", "-u", root.getScript].concat(args)
   }
 
   function focusUrl() {
@@ -142,7 +147,7 @@ Panel {
 
   function openLastFile() {
     if (!root.lastPath) return
-    Quickshell.execDetached(["xdg-open", root.lastPath])
+    Quickshell.execDetached(["/usr/bin/xdg-open", "--", root.lastPath])
   }
 
   function cancelJob() {
@@ -344,11 +349,20 @@ Panel {
 
   Process {
     id: pasteProc
-    command: ["wl-paste", "--no-newline", "--type", "text"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.applyClipboard(text)
+    command: ["/usr/bin/wl-paste", "--no-newline", "--type", "text"]
+    property string buf: ""
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) {
+        if (pasteProc.buf.length > 8192) {
+          pasteProc.running = false
+          return
+        }
+        pasteProc.buf += chunk
+      }
     }
+    onRunningChanged: if (running) pasteProc.buf = ""
+    onExited: root.applyClipboard(pasteProc.buf)
   }
 
   Process {
@@ -356,7 +370,10 @@ Panel {
     stdout: SplitParser {
       onRead: function(line) { root.handleResolveText(line) }
     }
-    stderr: StdioCollector { waitForEnd: true }
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function() {}
+    }
     onExited: {
       if (root.resolveStopping) {
         root.resolveStopping = false
@@ -374,7 +391,10 @@ Panel {
     stdout: SplitParser {
       onRead: function(line) { root.handleSaveLine(line) }
     }
-    stderr: StdioCollector { waitForEnd: true }
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function() {}
+    }
     onExited: {
       if (root.statusKind === "done") {
         root.busy = false
@@ -402,7 +422,10 @@ Panel {
     stdout: SplitParser {
       onRead: function(line) { root.handleSaveLine(line) }
     }
-    stderr: StdioCollector { waitForEnd: true }
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function() {}
+    }
     onExited: {
       if (root.statusKind === "done") {
         root.busy = false
@@ -543,6 +566,7 @@ Panel {
               Text {
                 width: parent.width
                 text: root.view === "settings" ? "Settings" : (root.view === "picker" ? "Choose a file" : "Cobalt")
+                textFormat: Text.PlainText
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.title
@@ -553,6 +577,7 @@ Panel {
               Text {
                 width: parent.width
                 text: "DOWNLOADER"
+                textFormat: Text.PlainText
                 color: root.mutedForeground
                 opacity: root.view === "main" ? 1 : 0
                 font.family: root.fontFamily
@@ -616,6 +641,7 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter
                 z: 1
                 text: "󰌹"
+                textFormat: Text.PlainText
                 color: root.mutedForeground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.title
@@ -692,6 +718,7 @@ Panel {
 
                         Text {
                           text: String(modelData.icon || "")
+                          textFormat: Text.PlainText
                           visible: text !== ""
                           color: root.foreground
                           font.family: root.fontFamily
@@ -701,6 +728,7 @@ Panel {
 
                         Text {
                           text: String(modelData.label || modelData.value)
+                          textFormat: Text.PlainText
                           color: root.foreground
                           font.family: root.fontFamily
                           font.pixelSize: Style.font.body
