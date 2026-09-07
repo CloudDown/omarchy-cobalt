@@ -111,6 +111,8 @@ def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     try:
         with open_url(req) as resp:
             body = read_capped(resp, MAX_JSON).decode("utf-8", errors="replace")
+    except ValueError:
+        return error_payload("error.http", "Instance returned too much data")
     except urllib.error.HTTPError as exc:
         try:
             body = read_capped(exc, MAX_JSON).decode("utf-8", errors="replace")
@@ -411,11 +413,29 @@ def cmd_probe(args: argparse.Namespace) -> int:
     )
     try:
         with open_url(req, timeout=12) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            emit(json.loads(body) if body else {"ok": True})
-            return 0
+            raw = read_capped(resp, MAX_JSON)
+    except ValueError:
+        return fail("Instance returned too much data", "error.http")
+    except urllib.error.HTTPError as exc:
+        try:
+            read_capped(exc, MAX_JSON)
+        except ValueError:
+            return fail("Instance returned too much data", "error.http")
+        return fail(f"HTTP {exc.code}", "error.http")
+    except urllib.error.URLError as exc:
+        return fail(str(exc.reason or exc), "error.api.fetch.fail")
     except Exception as exc:  # noqa: BLE001
         return fail(str(exc), "error.api.fetch.fail")
+    body = raw.decode("utf-8", errors="replace")
+    if not body:
+        emit({"ok": True})
+        return 0
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return fail("Instance returned non-JSON", "error.http")
+    emit(parsed if isinstance(parsed, dict) else {"ok": True})
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
