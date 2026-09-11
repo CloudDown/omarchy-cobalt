@@ -10,9 +10,11 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import ssl
+import stat
 import subprocess
 import sys
 import urllib.error
@@ -180,6 +182,45 @@ def unique_path(directory: str, filename: str) -> str:
         n += 1
 
 
+def open_owned_dir(path: str) -> tuple[str, int]:
+    directory = os.path.abspath(os.path.expanduser(path or "") or os.path.expanduser("~/Downloads"))
+    os.makedirs(directory, exist_ok=True)
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+            raise PermissionError("refusing untrusted download directory")
+        return directory, fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def exclusive_tmp(dirfd: int, prefix: str, flags: int = os.O_RDWR) -> tuple[str, int]:
+    for _ in range(16):
+        name = prefix + secrets.token_hex(16)
+        try:
+            fd = os.open(
+                name,
+                flags | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=dirfd,
+            )
+        except FileExistsError:
+            continue
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            os.close(fd)
+            try:
+                os.unlink(name, dir_fd=dirfd)
+            except OSError:
+                pass
+            raise
+        return name, fd
+    raise OSError("could not create exclusive temporary")
+
+
 def filename_from_headers(headers: Any, fallback: str) -> str:
     disposition = headers.get("Content-Disposition") if headers else None
     if disposition:
@@ -193,8 +234,6 @@ def cmd_save(args: argparse.Namespace) -> int:
     url = http_url(args.url)
     if not url:
         return fail("Refusing to fetch a non-HTTP URL", "error.plugin")
-    directory = os.path.expanduser(args.dir or "") or os.path.expanduser("~/Downloads")
-    os.makedirs(directory, exist_ok=True)
 
     req = urllib.request.Request(url, headers={"User-Agent": UA}, method="GET")
     try:
@@ -204,48 +243,69 @@ def cmd_save(args: argparse.Namespace) -> int:
     except urllib.error.URLError as exc:
         return fail(str(exc.reason or exc), "error.api.fetch.fail")
 
-    filename = filename_from_headers(resp.headers, args.filename or "cobalt-download")
-    path = unique_path(directory, filename)
-    total = 0
+    dirfd = -1
+    part_fd = -1
+    part_name = ""
     try:
-        length = resp.headers.get("Content-Length") or resp.headers.get("Estimated-Content-Length")
-        total = int(length) if length else 0
-    except (TypeError, ValueError):
+        directory, dirfd = open_owned_dir(args.dir)
+        filename = filename_from_headers(resp.headers, args.filename or "cobalt-download")
+        path = unique_path(directory, filename)
+        dest_name = os.path.basename(path)
         total = 0
-
-    emit({"event": "start", "filename": os.path.basename(path), "path": path, "bytes": total})
-    written = 0
-    last_percent = -1
-    tmp_path = path + ".part"
-    try:
-        with open(tmp_path, "wb") as fh:
-            while True:
-                chunk = resp.read(CHUNK)
-                if not chunk:
-                    break
-                fh.write(chunk)
-                written += len(chunk)
-                if written > MAX_FILE:
-                    raise ValueError("file exceeded size limit")
-                if total > 0:
-                    percent = min(100, int(written * 100 / total))
-                    if percent != last_percent:
-                        last_percent = percent
-                        emit({"event": "progress", "percent": percent, "bytes": written, "total": total})
-                elif written == chunk:
-                    emit({"event": "progress", "percent": -1, "bytes": written, "total": 0})
-        os.replace(tmp_path, path)
-    except Exception as exc:  # noqa: BLE001
         try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+            length = resp.headers.get("Content-Length") or resp.headers.get("Estimated-Content-Length")
+            total = int(length) if length else 0
+        except (TypeError, ValueError):
+            total = 0
+
+        emit({"event": "start", "filename": dest_name, "path": path, "bytes": total})
+        part_name, part_fd = exclusive_tmp(dirfd, ".cobalt-part.", flags=os.O_WRONLY)
+        written = 0
+        last_percent = -1
+        while True:
+            chunk = resp.read(CHUNK)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                n = os.write(part_fd, view)
+                view = view[n:]
+            written += len(chunk)
+            if written > MAX_FILE:
+                raise ValueError("file exceeded size limit")
+            if total > 0:
+                percent = min(100, int(written * 100 / total))
+                if percent != last_percent:
+                    last_percent = percent
+                    emit({"event": "progress", "percent": percent, "bytes": written, "total": total})
+            elif written == chunk:
+                emit({"event": "progress", "percent": -1, "bytes": written, "total": 0})
+        os.fsync(part_fd)
+        os.rename(part_name, dest_name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        os.fsync(dirfd)
+        part_name = ""
+    except Exception as exc:  # noqa: BLE001
         return fail(str(exc), "error.plugin")
     finally:
         try:
             resp.close()
         except Exception:  # noqa: BLE001
             pass
+        if part_fd >= 0:
+            try:
+                os.close(part_fd)
+            except OSError:
+                pass
+        if dirfd >= 0:
+            if part_name:
+                try:
+                    os.unlink(part_name, dir_fd=dirfd)
+                except OSError:
+                    pass
+            try:
+                os.close(dirfd)
+            except OSError:
+                pass
 
     emit({"event": "done", "path": path, "filename": os.path.basename(path), "bytes": written})
     return 0
@@ -291,117 +351,142 @@ def cmd_ytdlp(args: argparse.Namespace) -> int:
     if not binary:
         return fail("yt-dlp is not installed", "error.plugin")
 
-    directory = os.path.expanduser(args.dir or "") or os.path.expanduser("~/Downloads")
-    os.makedirs(directory, exist_ok=True)
-    marker = os.path.join(directory, f".cobalt-ytdlp-{os.getpid()}")
-    template = os.path.join(directory, "%(title).120B [%(id)s].%(ext)s")
-    flags = [
-        "--ignore-config",
-        "--no-playlist",
-        "--no-warnings",
-        "--no-color",
-        "--newline",
-        "--progress",
-        "--progress-template", "download:COBALT %(progress._percent_str)s",
-        "--restrict-filenames",
-        "-o", template,
-        "--print-to-file", "after_move:filepath", marker,
-    ]
-    if args.mode == "audio":
-        flags = ["-x"] + flags
-        fmt = str(args.audio_format or "mp3")
-        if fmt and fmt != "best":
-            flags = ["--audio-format", fmt] + flags
-    else:
-        flags += ["-f", ytdlp_format(args.mode, args.quality)]
-        if args.mode == "auto":
-            flags += ["--merge-output-format", "mp4"]
-    cmd = ytdlp_argv(binary) + flags + ["--", url]
-
-    emit({"event": "start", "filename": "yt-dlp", "path": "", "bytes": 0})
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        start_new_session=True,
-        env=env,
-    )
-
-    def stop(_signum=None, _frame=None) -> None:
-        if proc.poll() is not None:
-            return
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except OSError:
-            proc.terminate()
-
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
-
-    last_percent = -1
-    last_path = ""
-    filename = "yt-dlp"
-    out_bytes = 0
-    percent_re = re.compile(r"(?:COBALT|\[download\])\s+(\d+(?:\.\d+)?)%")
-    dest_re = re.compile(r"Destination:\s+(.+)$")
-    merge_re = re.compile(r'Merging formats into "(.+)"')
+    dirfd = -1
+    marker_fd = -1
+    marker_name = ""
     try:
-        assert proc.stdout is not None
-        for raw in proc.stdout:
-            out_bytes += len(raw.encode("utf-8", "replace"))
-            if out_bytes > MAX_YTDLP_OUT:
-                stop()
-                return fail("yt-dlp output exceeded size limit", "error.plugin")
-            line = raw.strip()
-            if not line:
-                continue
-            dest = dest_re.search(line) or merge_re.search(line)
-            if dest:
-                last_path = dest.group(1).strip().strip('"')
-                filename = os.path.basename(last_path)
-                emit({"event": "start", "filename": filename, "path": last_path, "bytes": 0})
-                continue
-            match = percent_re.search(line)
-            if not match:
-                continue
-            percent = min(100, int(float(match.group(1))))
-            if percent == last_percent:
-                continue
-            last_percent = percent
-            emit({"event": "progress", "percent": percent, "filename": filename})
-        code = proc.wait()
-    except Exception as exc:  # noqa: BLE001
-        stop()
-        try:
-            proc.wait(timeout=5)
-        except Exception:  # noqa: BLE001
+        directory, dirfd = open_owned_dir(args.dir)
+        marker_name, marker_fd = exclusive_tmp(dirfd, ".cobalt-ytdlp.")
+        marker = os.path.join(directory, marker_name)
+        template = os.path.join(directory, "%(title).120B [%(id)s].%(ext)s")
+        flags = [
+            "--ignore-config",
+            "--no-playlist",
+            "--no-warnings",
+            "--no-color",
+            "--newline",
+            "--progress",
+            "--progress-template", "download:COBALT %(progress._percent_str)s",
+            "--restrict-filenames",
+            "-o", template,
+            "--print-to-file", "after_move:filepath", marker,
+        ]
+        if args.mode == "audio":
+            flags = ["-x"] + flags
+            fmt = str(args.audio_format or "mp3")
+            if fmt and fmt != "best":
+                flags = ["--audio-format", fmt] + flags
+        else:
+            flags += ["-f", ytdlp_format(args.mode, args.quality)]
+            if args.mode == "auto":
+                flags += ["--merge-output-format", "mp4"]
+        cmd = ytdlp_argv(binary) + flags + ["--", url]
+
+        emit({"event": "start", "filename": "yt-dlp", "path": "", "bytes": 0})
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+            env=env,
+        )
+
+        def stop(_signum=None, _frame=None) -> None:
+            if proc.poll() is not None:
+                return
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                os.killpg(proc.pid, signal.SIGTERM)
             except OSError:
-                proc.kill()
-        return fail(str(exc), "error.plugin")
+                proc.terminate()
 
-    path = ""
-    try:
-        with open(marker, encoding="utf-8") as fh:
-            path = fh.read().strip().splitlines()[-1].strip()
-    except (OSError, IndexError):
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+
+        last_percent = -1
+        last_path = ""
+        filename = "yt-dlp"
+        out_bytes = 0
+        percent_re = re.compile(r"(?:COBALT|\[download\])\s+(\d+(?:\.\d+)?)%")
+        dest_re = re.compile(r"Destination:\s+(.+)$")
+        merge_re = re.compile(r'Merging formats into "(.+)"')
+        try:
+            assert proc.stdout is not None
+            for raw in proc.stdout:
+                out_bytes += len(raw.encode("utf-8", "replace"))
+                if out_bytes > MAX_YTDLP_OUT:
+                    stop()
+                    return fail("yt-dlp output exceeded size limit", "error.plugin")
+                line = raw.strip()
+                if not line:
+                    continue
+                dest = dest_re.search(line) or merge_re.search(line)
+                if dest:
+                    last_path = dest.group(1).strip().strip('"')
+                    filename = os.path.basename(last_path)
+                    emit({"event": "start", "filename": filename, "path": last_path, "bytes": 0})
+                    continue
+                match = percent_re.search(line)
+                if not match:
+                    continue
+                percent = min(100, int(float(match.group(1))))
+                if percent == last_percent:
+                    continue
+                last_percent = percent
+                emit({"event": "progress", "percent": percent, "filename": filename})
+            code = proc.wait()
+        except Exception as exc:  # noqa: BLE001
+            stop()
+            try:
+                proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+            return fail(str(exc), "error.plugin")
+
         path = ""
-    try:
-        os.unlink(marker)
-    except OSError:
-        pass
-    if not path:
-        path = last_path
+        try:
+            os.lseek(marker_fd, 0, os.SEEK_SET)
+            os.set_blocking(marker_fd, True)
+            raw_path = os.read(marker_fd, 4097)
+            if len(raw_path) <= 4096:
+                text = raw_path.decode("utf-8", "replace").strip()
+                if text:
+                    path = text.splitlines()[-1].strip()
+        except (OSError, IndexError):
+            path = ""
+        if not path:
+            path = last_path
 
-    if code != 0 or not path or not os.path.isfile(path):
-        return fail("yt-dlp could not download that link", "error.plugin")
-    emit({"event": "done", "path": path, "filename": os.path.basename(path), "bytes": os.path.getsize(path)})
-    return 0
+        if code != 0 or not path or not os.path.isfile(path):
+            return fail("yt-dlp could not download that link", "error.plugin")
+        emit({"event": "done", "path": path, "filename": os.path.basename(path), "bytes": os.path.getsize(path)})
+        return 0
+    except PermissionError:
+        return fail("Download folder is not usable", "error.plugin")
+    except OSError as exc:
+        return fail(str(exc), "error.plugin")
+    finally:
+        if marker_fd >= 0:
+            try:
+                os.close(marker_fd)
+            except OSError:
+                pass
+        if dirfd >= 0:
+            if marker_name:
+                try:
+                    os.unlink(marker_name, dir_fd=dirfd)
+                except OSError:
+                    pass
+            try:
+                os.close(dirfd)
+            except OSError:
+                pass
 
 
 def cmd_probe(args: argparse.Namespace) -> int:
