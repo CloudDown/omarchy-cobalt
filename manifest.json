@@ -2,17 +2,17 @@
   "schemaVersion": 1,
   "id": "clouddown.cobalt",
   "name": "Cobalt Download",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "author": "CloudDown",
   "license": "MIT",
-  "description": "Paste a link and save the video or audio with cobalt.",
+  "description": "Save YouTube, TikTok and X from the bar. Cobalt first, yt-dlp if the instance can't. Video or MP3.",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "Cobalt.qml"
   },
   "barWidget": {
     "displayName": "Cobalt Download",
-    "description": "Download media from a link, from the bar",
+    "description": "Save YouTube, TikTok and X from the bar",
     "category": "Tools",
     "allowMultiple": false,
     "defaultSection": "right"

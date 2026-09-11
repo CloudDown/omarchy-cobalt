@@ -4,7 +4,7 @@
 
 # Cobalt Download
 
-Paste a link, save the file. An unofficial [Omarchy](https://omarchy.org) bar panel.
+Paste a YouTube, TikTok or X link, save the file. An unofficial [Omarchy](https://omarchy.org) bar panel.
 
 Not [cobalt.tools](https://cobalt.tools). Not affiliated with [imput](https://github.com/imputnet/cobalt).
 
