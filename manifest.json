@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "clouddown.cobalt",
   "name": "Cobalt Download",
-  "version": "1.3.5",
+  "version": "1.3.6",
   "author": "CloudDown",
   "license": "MIT",
   "description": "Save YouTube, TikTok and X from the bar. Cobalt first, yt-dlp if the instance can't. Video or MP3.",

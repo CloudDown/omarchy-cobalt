@@ -4,14 +4,11 @@ var DEFAULT_INSTANCE = "https://cobaltapi.cjs.nz"
 
 var DEFAULTS = {
   instance: DEFAULT_INSTANCE,
-  apiKey: "",
   downloadDir: "",
   videoQuality: "1080",
   audioFormat: "mp3",
   downloadMode: "auto",
-  filenameStyle: "pretty",
-  alwaysProxy: true,
-  webFallback: true
+  filenameStyle: "pretty"
 }
 
 var MODE_OPTIONS = [
@@ -59,7 +56,7 @@ var ERROR_MESSAGES = {
   "error.http": "The instance returned an unexpected error."
 }
 
-var STRING_KEYS = ["instance", "apiKey", "downloadDir", "videoQuality", "audioFormat", "downloadMode", "filenameStyle"]
+var STRING_KEYS = ["instance", "downloadDir", "videoQuality", "audioFormat", "downloadMode", "filenameStyle"]
 var MODES = ["auto", "audio", "mute"]
 var QUALITIES = ["max", "4320", "2160", "1440", "1080", "720", "480", "360", "240", "144"]
 var AUDIO_FORMATS = ["best", "mp3", "ogg", "wav", "opus"]
@@ -84,8 +81,6 @@ function mergeConfig(raw) {
     if (parsed[key] !== undefined && parsed[key] !== null)
       out[key] = String(parsed[key])
   }
-  if (parsed.alwaysProxy !== undefined) out.alwaysProxy = !!parsed.alwaysProxy
-  if (parsed.webFallback !== undefined) out.webFallback = !!parsed.webFallback
   out.instance = normalizeInstance(out.instance)
   if (MODES.indexOf(out.downloadMode) === -1) out.downloadMode = "auto"
   if (QUALITIES.indexOf(out.videoQuality) === -1) out.videoQuality = "1080"
@@ -97,14 +92,11 @@ function serializeConfig(cfg) {
   var merged = mergeConfig(cfg)
   return JSON.stringify({
     instance: merged.instance,
-    apiKey: merged.apiKey,
     downloadDir: merged.downloadDir,
     videoQuality: merged.videoQuality,
     audioFormat: merged.audioFormat,
     downloadMode: merged.downloadMode,
-    filenameStyle: merged.filenameStyle,
-    alwaysProxy: merged.alwaysProxy,
-    webFallback: merged.webFallback
+    filenameStyle: merged.filenameStyle
   }, null, 2) + "\n"
 }
 
@@ -186,16 +178,23 @@ function parseJsonPayload(raw) {
   try { return JSON.parse(text) } catch (e) { return null }
 }
 
+function plainLabel(value) {
+  var s = String(value || "").replace(/[<>&]/g, "").replace(/[\x00-\x1f\x7f]/g, "")
+  if (s.length > 80) s = s.slice(0, 80)
+  return s
+}
+
 function pickerRows(payload) {
   var items = payload && payload.picker ? payload.picker : []
   var rows = []
-  for (var i = 0; i < items.length; i++) {
+  var n = items.length > 32 ? 32 : items.length
+  for (var i = 0; i < n; i++) {
     var item = items[i] || {}
     rows.push({
       itemType: String(item.type || "photo"),
       url: String(item.url || ""),
       thumb: String(item.thumb || ""),
-      label: (item.type || "item") + " " + (i + 1)
+      label: plainLabel((item.type || "item") + " " + (i + 1))
     })
   }
   if (payload && payload.audio) {
@@ -203,7 +202,7 @@ function pickerRows(payload) {
       itemType: "audio",
       url: String(payload.audio),
       thumb: "",
-      label: payload.audioFilename || "audio"
+      label: plainLabel(payload.audioFilename || "audio")
     })
   }
   return rows

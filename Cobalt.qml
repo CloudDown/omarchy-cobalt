@@ -62,8 +62,17 @@ Panel {
     })
   }
 
+  function expandHome(path) {
+    var value = String(path || "").trim()
+    if (value === "~")
+      return Quickshell.env("HOME") || value
+    if (value.indexOf("~/") === 0)
+      return (Quickshell.env("HOME") || "") + value.slice(1)
+    return value
+  }
+
   function open() {
-    if (!root.busy) {
+    if (!root.busy && root.statusKind !== "done") {
       root.view = "main"
       root.statusKind = "idle"
       root.statusText = ""
@@ -71,9 +80,12 @@ Panel {
       root.pickerItems = []
       root.urlText = ""
       if (urlField) urlField.text = ""
+    } else if (!root.busy) {
+      root.view = "main"
     }
     root.controller.show()
-    root.focusUrl()
+    if (root.statusKind !== "done")
+      root.focusUrl()
   }
 
   function close() {
@@ -126,12 +138,12 @@ Panel {
   }
 
   function downloadClicked() {
-    if (root.busy) {
-      root.cancelJob()
+    if (root.statusKind === "done" && !root.busy) {
+      root.openLastFile()
       return
     }
-    if (root.statusKind === "done") {
-      root.openLastFile()
+    if (root.busy) {
+      root.cancelJob()
       return
     }
     if (!root.canSubmit) return
@@ -139,15 +151,33 @@ Panel {
   }
 
   function setStatus(kind, text, percent) {
+    var t = String(text || "").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "")
+    if (t.length > 240) t = t.slice(0, 240)
     root.statusKind = kind
-    root.statusText = text || ""
+    root.statusText = t
     if (percent === undefined) return
     root.progressPercent = percent
   }
 
+  function pathUnderHome(path) {
+    var home = String(Quickshell.env("HOME") || "").replace(/\/+$/, "")
+    if (!home || home.charAt(0) !== "/") return false
+    if (path !== home && path.indexOf(home + "/") !== 0) return false
+    var parts = path.split("/")
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i] === "..") return false
+    }
+    return true
+  }
+
   function openLastFile() {
-    if (!root.lastPath) return
-    Quickshell.execDetached(["/usr/bin/xdg-open", "--", root.lastPath])
+    var path = root.expandHome(root.lastPath)
+    if (!path || path.charAt(0) !== "/" || path.indexOf("\0") >= 0 || !root.pathUnderHome(path)) {
+      root.setStatus("error", "Nothing to open.")
+      return
+    }
+    root.close()
+    Util.execArgv(["xdg-open", path])
   }
 
   function cancelJob() {
@@ -288,7 +318,11 @@ Panel {
       return
     }
     if (event === "done") {
-      root.lastPath = String(payload.path || "")
+      var saved = String(payload.path || "").trim()
+      if (!saved && payload.filename)
+        saved = root.expandHome(root.config.downloadDir) + "/" + Model.basename(String(payload.filename))
+      root.lastPath = saved
+      root.busy = false
       root.setStatus("done", Model.basename(root.lastPath) || "Saved", 100)
       return
     }
@@ -533,7 +567,7 @@ Panel {
       onCloseRequested: root.handleCloseKey()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onActivateRequested: {
-        if (root.view === "main" && root.canSubmit) root.startDownload()
+        if (root.view === "main") root.downloadClicked()
       }
 
       Flickable {
@@ -652,6 +686,7 @@ Panel {
                 anchors.fill: parent
                 leftPadding: Style.space(36)
                 placeholderText: "paste the link here"
+                maximumLength: 2048
                 foreground: root.foreground
                 font.family: root.fontFamily
                 onTextChanged: if (root.urlText !== text) root.urlText = text
@@ -886,6 +921,7 @@ Panel {
                 width: parent.width
                 text: root.settingsDir
                 placeholderText: "~/Downloads"
+                maximumLength: 512
                 foreground: root.foreground
                 font.family: root.fontFamily
                 onTextChanged: {

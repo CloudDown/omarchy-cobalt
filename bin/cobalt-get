@@ -55,12 +55,32 @@ def fail(message: str, code: str = "error.plugin") -> int:
 
 
 def load_config(path: str | None) -> dict[str, Any]:
+    target = os.path.abspath(os.path.expanduser(path or DEFAULT_CONFIG))
     try:
-        with open(path or DEFAULT_CONFIG, encoding="utf-8") as fh:
-            parsed = json.load(fh)
-            return parsed if isinstance(parsed, dict) else {}
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
         return {}
+    except OSError:
+        return {}
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_JSON:
+            return {}
+        os.set_blocking(fd, True)
+        data = b""
+        while len(data) <= MAX_JSON:
+            chunk = os.read(fd, min(65536, MAX_JSON + 1 - len(data)))
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > MAX_JSON:
+            return {}
+        parsed = json.loads(data.decode("utf-8"))
+        return parsed if isinstance(parsed, dict) else {}
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return {}
+    finally:
+        os.close(fd)
 
 
 def instance_url(raw: str) -> str:
@@ -489,40 +509,6 @@ def cmd_ytdlp(args: argparse.Namespace) -> int:
                 pass
 
 
-def cmd_probe(args: argparse.Namespace) -> int:
-    cfg = load_config(args.config)
-    req = urllib.request.Request(
-        instance_url(args.instance or cfg.get("instance") or ""),
-        headers={"Accept": "application/json", "User-Agent": UA},
-        method="GET",
-    )
-    try:
-        with open_url(req, timeout=12) as resp:
-            raw = read_capped(resp, MAX_JSON)
-    except ValueError:
-        return fail("Instance returned too much data", "error.http")
-    except urllib.error.HTTPError as exc:
-        try:
-            read_capped(exc, MAX_JSON)
-        except ValueError:
-            return fail("Instance returned too much data", "error.http")
-        return fail(f"HTTP {exc.code}", "error.http")
-    except urllib.error.URLError as exc:
-        return fail(str(exc.reason or exc), "error.api.fetch.fail")
-    except Exception as exc:  # noqa: BLE001
-        return fail(str(exc), "error.api.fetch.fail")
-    body = raw.decode("utf-8", errors="replace")
-    if not body:
-        emit({"ok": True})
-        return 0
-    try:
-        parsed = json.loads(body)
-    except json.JSONDecodeError:
-        return fail("Instance returned non-JSON", "error.http")
-    emit(parsed if isinstance(parsed, dict) else {"ok": True})
-    return 0
-
-
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--config", default=DEFAULT_CONFIG)
@@ -544,10 +530,6 @@ def build_parser() -> argparse.ArgumentParser:
     save.add_argument("--filename", default="")
     save.add_argument("--dir", default="")
     save.set_defaults(func=cmd_save)
-
-    probe = sub.add_parser("probe", help="GET / on an instance", parents=[common])
-    probe.add_argument("--instance")
-    probe.set_defaults(func=cmd_probe)
 
     ytdlp = sub.add_parser("ytdlp", help="Download with yt-dlp when cobalt cannot", parents=[common])
     ytdlp.add_argument("--url", required=True)
