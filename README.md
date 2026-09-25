@@ -25,7 +25,7 @@ Also needed: `python3`, `wl-paste`, `xdg-open` (stock Omarchy).
 
 ## Use
 
-Click the bar icon → **paste** a URL → **auto** / **audio** / **mute** → **download**. After a save, **open** runs `xdg-open` on the file.
+Click the bar icon → **paste** a URL → **auto** / **audio** / **mute** → **download**. After a save, the panel shows a full-width **open**. Closing it or typing in the link field returns to a fresh download.
 
 Cobalt API first, then **yt-dlp** if the instance cannot fetch the link. Gear = quality, audio format, folder.
 

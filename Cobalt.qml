@@ -49,8 +49,14 @@ Panel {
   }
   readonly property string configPath: Quickshell.env("HOME") + "/.config/omarchy/cobalt.json"
   readonly property bool canSubmit: Model.looksLikeUrl(root.urlText) && !root.busy
+  readonly property bool afterDownload: root.statusKind === "done" && !root.busy
   readonly property bool editing: (urlField && urlField.activeFocus)
     || (dirField && dirField.activeFocus)
+
+  onOpenedChanged: {
+    if (!root.opened && !root.busy)
+      root.resetSession()
+  }
 
   function python(args) {
     return ["/usr/bin/python3", "-I", "-S", "-u", root.getScript].concat(args)
@@ -71,20 +77,36 @@ Panel {
     return value
   }
 
+  function resetSession() {
+    root.view = "main"
+    root.statusKind = "idle"
+    root.statusText = ""
+    root.progressPercent = -1
+    root.pickerItems = []
+    root.pickerIndex = 0
+    root.saveQueue = []
+    root.lastCobaltError = ""
+    root.lastPath = ""
+    root.resolveGotReply = false
+    root.ytdlpTried = false
+    root.urlText = ""
+    if (urlField) urlField.text = ""
+  }
+
+  function leaveDoneState() {
+    if (root.busy || root.statusKind !== "done")
+      return
+    root.lastPath = ""
+    root.setStatus("idle", "")
+  }
+
   function open() {
-    if (!root.busy && root.statusKind !== "done") {
+    if (!root.busy)
+      root.resetSession()
+    else
       root.view = "main"
-      root.statusKind = "idle"
-      root.statusText = ""
-      root.progressPercent = -1
-      root.pickerItems = []
-      root.urlText = ""
-      if (urlField) urlField.text = ""
-    } else if (!root.busy) {
-      root.view = "main"
-    }
     root.controller.show()
-    if (root.statusKind !== "done")
+    if (!root.busy)
       root.focusUrl()
   }
 
@@ -129,6 +151,7 @@ Panel {
     }
     root.urlText = url
     if (urlField) urlField.text = url
+    root.leaveDoneState()
     if (root.statusKind === "error") root.setStatus("idle", "")
     root.focusUrl()
   }
@@ -196,6 +219,7 @@ Panel {
       return
     }
     root.urlText = url
+    root.lastPath = ""
     root.pickerItems = []
     root.view = "main"
     root.busy = true
@@ -689,8 +713,11 @@ Panel {
                 maximumLength: 2048
                 foreground: root.foreground
                 font.family: root.fontFamily
-                onTextChanged: if (root.urlText !== text) root.urlText = text
-                onAccepted: if (root.canSubmit) root.startDownload()
+                onTextChanged: {
+                  if (root.urlText !== text) root.urlText = text
+                  root.leaveDoneState()
+                }
+                onAccepted: root.downloadClicked()
                 Keys.onPressed: function(event) {
                   if (event.key === Qt.Key_Escape) {
                     root.close()
@@ -702,6 +729,7 @@ Panel {
 
             Item {
               width: parent.width
+              visible: !root.afterDownload
               implicitHeight: Math.max(modeGroup.implicitHeight, downloadButton.implicitHeight)
 
               BorderSurface {
@@ -796,13 +824,22 @@ Panel {
 
                 ActionButton {
                   id: downloadButton
-                  text: root.busy ? "cancel" : (root.statusKind === "done" ? "open" : "download")
-                  iconText: root.busy ? "󰜺" : (root.statusKind === "done" ? "󰏌" : "󰇚")
+                  text: root.busy ? "cancel" : "download"
+                  iconText: root.busy ? "󰜺" : "󰇚"
                   selected: !root.busy
-                  enabled: root.busy || root.statusKind === "done" || root.canSubmit
+                  enabled: root.busy || root.canSubmit
                   onClicked: root.downloadClicked()
                 }
               }
+            }
+
+            ActionButton {
+              width: parent.width
+              visible: root.afterDownload
+              text: "open"
+              iconText: "󰏌"
+              selected: true
+              onClicked: root.openLastFile()
             }
 
             Column {
